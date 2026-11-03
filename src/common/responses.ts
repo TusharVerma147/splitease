@@ -13,7 +13,7 @@ interface ErrorResponse {
   requestId?: string;
 }
 
-interface PaginatedData<T> {
+export interface PaginatedData<T> {
   items: T[];
   page: number;
   limit: number;
