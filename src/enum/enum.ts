@@ -38,4 +38,6 @@ export enum EventType {
   EXPENSE_DELETED = 'expense.deleted',
   SETTLEMENT_CREATED = 'settlement.created',
   MEMBER_ADDED = 'member.added',
+  MEMBER_REMOVED = 'member.removed',
+  EXPORT_REQUESTED = 'export.requested',
 }

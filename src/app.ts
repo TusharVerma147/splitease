@@ -1,16 +1,16 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express, { Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import { v4 as uuidv4 } from 'uuid';
+import mongoose from 'mongoose';
+import { randomUUID } from 'crypto';
 import { config } from './config/configuration';
 import { headerValidator } from './middlewares/header.validator';
-import { sendError } from './common/responses';
-import { AppError } from './common/errors';
+import { errorMiddleware, notFoundMiddleware } from './middlewares/error.middleware';
 import { logger } from './logger/logger';
+import { asyncHandler } from './common/utils';
 import { redisService } from './providers/redis/redis.service';
 import { healthCheck as rabbitHealthCheck } from './providers/rabbitmq/rabbitmq.provider';
-import mongoose from 'mongoose';
 import v1Router from './app.routes';
 
 const app = express();
@@ -19,49 +19,53 @@ app.use(helmet());
 
 app.use(
   cors({
-    origin: config.CORS_ORIGINS.split(','),
-    exposedHeaders: ['x-access-token', 'x-refresh-token'],
+    origin: config.CORS_ORIGINS.split(',').map((o) => o.trim()),
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'device_id',
+      'device_type',
+      'timezone',
+      'lang',
+      'x-refresh-token',
+    ],
+    // Without this the browser cannot read the tokens from the response headers.
+    exposedHeaders: ['x-access-token', 'x-refresh-token', 'x-request-id'],
   }),
 );
 
-app.use(express.json());
-
-app.use((req: Request, _res: Response, next: NextFunction) => {
-  req.requestId = uuidv4();
+// Correlation id: reuse the caller's, or mint one. Echoed back and used in logs + error bodies.
+app.use((req, res, next) => {
+  const incoming = req.headers['x-request-id'];
+  req.requestId = typeof incoming === 'string' && incoming.length <= 100 ? incoming : randomUUID();
+  res.setHeader('x-request-id', req.requestId);
   next();
 });
 
+app.use(express.json({ limit: '100kb' }));
+
+morgan.token('id', (req) => (req as Request).requestId ?? '-');
 app.use(
-  morgan('combined', {
+  morgan(':id :method :url :status :res[content-length] - :response-time ms', {
     stream: { write: (msg) => logger.http(msg.trim()) },
-    skip: () => false,
   }),
 );
 
-app.get('/health', async (_req: Request, res: Response) => {
-  const [redisOk, rabbitOk] = await Promise.all([
-    redisService.ping(),
-    rabbitHealthCheck(),
-  ]);
-  const mongoOk = mongoose.connection.readyState === 1;
-  res.json({ mongo: mongoOk, redis: redisOk, rabbitmq: rabbitOk });
-});
+// The only route exempt from the device headers.
+app.get(
+  '/health',
+  asyncHandler(async (_req: Request, res: Response) => {
+    const [redisOk, rabbitOk] = await Promise.all([redisService.ping(), rabbitHealthCheck()]);
+    const mongoOk = mongoose.connection.readyState === 1;
+    const healthy = mongoOk && redisOk && rabbitOk;
+    res.status(healthy ? 200 : 503).json({ mongo: mongoOk, redis: redisOk, rabbitmq: rabbitOk });
+  }),
+);
 
 app.use('/api', headerValidator);
-
 app.use('/api/v1', v1Router);
 
-app.use((_req: Request, res: Response) => {
-  sendError(res, 404, 'NOT_FOUND', 'Route not found');
-});
-
-app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
-  if (err instanceof AppError) {
-    sendError(res, err.statusCode, err.code, err.message, req.requestId);
-    return;
-  }
-  logger.error('Unhandled error', { err });
-  sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', req.requestId);
-});
+app.use(notFoundMiddleware);
+app.use(errorMiddleware);
 
 export default app;

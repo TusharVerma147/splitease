@@ -10,8 +10,10 @@
     "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "dev:consumer": "ts-node-dev --respawn --transpile-only src/consumer.ts",
     "lint": "eslint src --ext .ts",
-    "format": "prettier --write src/**/*.ts",
-    "test": "jest"
+    "format": "prettier --write \"src/**/*.ts\"",
+    "test": "jest",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "amqplib": "^0.10.4",
@@ -56,5 +58,8 @@
     "testMatch": [
       "**/*.test.ts"
     ]
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
