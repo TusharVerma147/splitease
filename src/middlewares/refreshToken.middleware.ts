@@ -2,37 +2,21 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from '../config/configuration';
 import { Errors } from '../common/errors';
-import { sendError } from '../common/responses';
+import { RefreshTokenPayload } from '../interfaces';
 
-export interface RefreshTokenPayload {
-  sub: string;
-  sid: string;
-  jti: string;
-}
-
-export async function refreshTokenMiddleware(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): Promise<void> {
-  const token = req.headers['x-refresh-token'] as string | undefined;
-  if (!token) {
-    const err = Errors.unauthorized();
-    sendError(res, err.statusCode, err.code, err.message, req.requestId);
-    return;
-  }
+/** Verifies the x-refresh-token header (only used by POST /auth/refresh). */
+export function refreshTokenMiddleware(req: Request, _res: Response, next: NextFunction): void {
+  const header = req.headers['x-refresh-token'];
+  const token = Array.isArray(header) ? header[0] : header;
+  if (!token) return next(Errors.unauthorized('x-refresh-token header is required'));
 
   try {
     const payload = jwt.verify(token, config.JWT_REFRESH_SECRET) as RefreshTokenPayload;
-    (req as Request & { refreshPayload?: RefreshTokenPayload }).refreshPayload = payload;
+    if (!payload.sub || !payload.sid || !payload.jti) return next(Errors.unauthorized());
+    req.refreshPayload = payload;
     next();
-  } catch (err) {
-    if (err instanceof jwt.TokenExpiredError) {
-      const e = Errors.tokenExpired();
-      sendError(res, e.statusCode, e.code, e.message, req.requestId);
-      return;
-    }
-    const e = Errors.unauthorized();
-    sendError(res, e.statusCode, e.code, e.message, req.requestId);
+  } catch {
+    // Expired or tampered refresh tokens both mean: log in again.
+    next(Errors.unauthorized('Invalid or expired refresh token'));
   }
 }

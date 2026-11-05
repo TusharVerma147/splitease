@@ -1,40 +1,46 @@
 import { Request, Response, NextFunction } from 'express';
 import { DEVICE_TYPES, SUPPORTED_LANGS } from '../common/constant';
 import { Errors } from '../common/errors';
-import { sendError } from '../common/responses';
-import { DeviceType } from '../enum/enum';
 
-export function headerValidator(req: Request, res: Response, next: NextFunction): void {
-  const deviceId = req.headers['device_id'] as string | undefined;
-  const deviceType = req.headers['device_type'] as string | undefined;
-  const timezone = req.headers['timezone'] as string | undefined;
-  const lang = req.headers['lang'] as string | undefined;
+function header(req: Request, name: string): string | undefined {
+  const value = req.headers[name];
+  const single = Array.isArray(value) ? value[0] : value;
+  const trimmed = single?.trim();
+  return trimmed ? trimmed : undefined;
+}
 
-  if (!deviceId || deviceId.trim() === '') {
-    const err = Errors.deviceIdRequired();
-    sendError(res, err.statusCode, err.code, err.message);
+function isValidTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** device_id, device_type, timezone and lang are required on every /api request. */
+export function headerValidator(req: Request, _res: Response, next: NextFunction): void {
+  // CORS preflight carries no custom headers.
+  if (req.method === 'OPTIONS') {
+    next();
     return;
   }
 
-  const deviceTypeNum = Number(deviceType);
-  if (!deviceType || !DEVICE_TYPES.includes(deviceTypeNum as DeviceType)) {
-    const err = Errors.deviceTypeRequired();
-    sendError(res, err.statusCode, err.code, err.message);
-    return;
+  const deviceId = header(req, 'device_id');
+  if (!deviceId) return next(Errors.deviceIdRequired());
+
+  const deviceTypeRaw = header(req, 'device_type');
+  const deviceType = Number(deviceTypeRaw);
+  if (!deviceTypeRaw || !(DEVICE_TYPES as readonly number[]).includes(deviceType)) {
+    return next(Errors.deviceTypeRequired());
   }
 
-  if (!timezone || timezone.trim() === '') {
-    const err = Errors.timezoneRequired();
-    sendError(res, err.statusCode, err.code, err.message);
-    return;
-  }
+  const timezone = header(req, 'timezone');
+  if (!timezone || !isValidTimezone(timezone)) return next(Errors.timezoneRequired());
 
-  if (!lang || !SUPPORTED_LANGS.includes(lang as 'en' | 'hi')) {
-    const err = Errors.langRequired();
-    sendError(res, err.statusCode, err.code, err.message);
-    return;
-  }
+  const lang = header(req, 'lang');
+  if (!lang || !(SUPPORTED_LANGS as readonly string[]).includes(lang)) return next(Errors.langRequired());
 
-  req.device = { deviceId, deviceType: deviceTypeNum, timezone, lang };
+  req.device = { deviceId, deviceType, timezone, lang };
   next();
 }

@@ -1,28 +1,16 @@
-import { Request, Response, NextFunction } from 'express';
 import { redisService } from '../providers/redis/redis.service';
 import { config } from '../config/configuration';
 import { Errors } from '../common/errors';
-import { sendError } from '../common/responses';
+import { asyncHandler } from '../common/utils';
 
-export async function loginRateLimit(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): Promise<void> {
-  const email = (req.body as { email?: string }).email ?? '';
+/** Login rate limit: LOGIN_RATE_LIMIT_MAX tries per window, per email + IP. */
+export const loginRateLimit = asyncHandler(async (req, _res, next) => {
+  const body = req.body as { email?: unknown } | undefined;
+  const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : '';
   const ip = req.ip ?? 'unknown';
 
-  const count = await redisService.incrementLoginAttempts(
-    email,
-    ip,
-    config.LOGIN_RATE_LIMIT_WINDOW_MS,
-  );
-
-  if (count > config.LOGIN_RATE_LIMIT_MAX) {
-    const err = Errors.tooManyAttempts();
-    sendError(res, err.statusCode, err.code, err.message, req.requestId);
-    return;
-  }
+  const count = await redisService.incrementLoginAttempts(email, ip, config.LOGIN_RATE_LIMIT_WINDOW_MS);
+  if (count > config.LOGIN_RATE_LIMIT_MAX) throw Errors.tooManyAttempts();
 
   next();
-}
+});

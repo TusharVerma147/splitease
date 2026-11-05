@@ -1,47 +1,32 @@
-import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { config } from '../config/configuration';
 import { redisService } from '../providers/redis/redis.service';
 import { Errors } from '../common/errors';
-import { sendError } from '../common/responses';
+import { asyncHandler } from '../common/utils';
 
 interface AccessTokenPayload {
   sub: string;
   sid: string;
 }
 
-export async function accessTokenMiddleware(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): Promise<void> {
+/** Verifies the Bearer JWT and that its session still exists in Redis (instant logout). */
+export const accessTokenMiddleware = asyncHandler(async (req, _res, next) => {
   const authHeader = req.headers['authorization'];
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    const err = Errors.unauthorized();
-    sendError(res, err.statusCode, err.code, err.message, req.requestId);
-    return;
-  }
+  if (!authHeader || !authHeader.startsWith('Bearer ')) throw Errors.unauthorized();
 
-  const token = authHeader.slice(7);
+  let payload: AccessTokenPayload;
   try {
-    const payload = jwt.verify(token, config.JWT_ACCESS_SECRET) as AccessTokenPayload;
-
-    const sessionUserId = await redisService.getSession(payload.sid);
-    if (!sessionUserId) {
-      const err = Errors.unauthorized();
-      sendError(res, err.statusCode, err.code, err.message, req.requestId);
-      return;
-    }
-
-    req.user = { userId: payload.sub, sessionId: payload.sid };
-    next();
+    payload = jwt.verify(authHeader.slice(7), config.JWT_ACCESS_SECRET) as AccessTokenPayload;
   } catch (err) {
-    if (err instanceof jwt.TokenExpiredError) {
-      const e = Errors.tokenExpired();
-      sendError(res, e.statusCode, e.code, e.message, req.requestId);
-      return;
-    }
-    const e = Errors.unauthorized();
-    sendError(res, e.statusCode, e.code, e.message, req.requestId);
+    if (err instanceof jwt.TokenExpiredError) throw Errors.tokenExpired();
+    throw Errors.unauthorized();
   }
-}
+
+  if (!payload.sub || !payload.sid) throw Errors.unauthorized();
+
+  const sessionUserId = await redisService.getSession(payload.sid);
+  if (!sessionUserId || sessionUserId !== payload.sub) throw Errors.unauthorized();
+
+  req.user = { userId: payload.sub, sessionId: payload.sid };
+  next();
+});
