@@ -1,38 +1,18 @@
-import { Channel, ConsumeMessage } from 'amqplib';
-import { getRabbitChannel } from '../rabbitmq/rabbitmq.provider';
 import { QueueName } from '../../enum/enum';
 import { exportService } from '../../modules/v1/export/export.service';
-import { logger } from '../../logger/logger';
+import { ConsumerHandle, startQueueConsumer } from './base.consumer';
 
-interface ExportEvent {
-  payload: { exportId: string; groupId: string };
-  messageId: string;
-}
-
-export async function startExportConsumer(): Promise<void> {
-  const channel: Channel = getRabbitChannel();
-  await channel.prefetch(1);
-
-  channel.consume(QueueName.EXPORT, (msg: ConsumeMessage | null) => {
-    if (!msg) return;
-
-    const processMsg = async () => {
-      try {
-        const event = JSON.parse(msg.content.toString()) as ExportEvent;
-        const { exportId, groupId } = event.payload;
-
-        logger.debug('Processing export', { exportId, groupId });
-        await exportService.processExport(exportId, groupId);
-        channel.ack(msg);
-        logger.debug('Export done', { exportId });
-      } catch (err) {
-        logger.error('Export consumer error', { err });
-        channel.nack(msg, false, false);
+/** Builds the CSV statement for an export request (CSV generation runs on a worker thread). */
+export function startExportConsumer(): Promise<ConsumerHandle> {
+  return startQueueConsumer({
+    name: 'export',
+    queue: QueueName.EXPORT,
+    handler: async (event) => {
+      const { exportId, groupId } = event.payload;
+      if (typeof exportId !== 'string' || typeof groupId !== 'string') {
+        throw new Error('export event without exportId/groupId');
       }
-    };
-
-    void processMsg();
+      await exportService.processExport(exportId, groupId);
+    },
   });
-
-  logger.info('Export consumer started');
 }

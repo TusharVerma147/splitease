@@ -1,16 +1,16 @@
 import { Request, Response } from 'express';
 import { activityService } from './activity.service';
-import { sendSuccess, sendError } from '../../../common/responses';
+import { sendSuccess } from '../../../common/responses';
+import { ListActivityQueryDto } from './dto/activity.dto';
 
 export class ActivityController {
-  async getMyActivity(req: Request, res: Response): Promise<void> {
-    try {
-      const result = await activityService.getMyActivity(req.user!.userId, req.query as Record<string, unknown>);
-      sendSuccess(res, result, 'Activity fetched');
-    } catch (err) {
-      sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', req.requestId);
-    }
-  }
+  getMyActivity = async (req: Request, res: Response): Promise<void> => {
+    const result = await activityService.getMyActivity(
+      req.user?.userId ?? '',
+      req.query as unknown as ListActivityQueryDto,
+    );
+    sendSuccess(res, result, 'Activity fetched');
+  };
 }
 
 export const activityController = new ActivityController();

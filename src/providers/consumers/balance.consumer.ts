@@ -1,43 +1,19 @@
-import { Channel, ConsumeMessage } from 'amqplib';
-import { getRabbitChannel } from '../rabbitmq/rabbitmq.provider';
 import { QueueName } from '../../enum/enum';
 import { balanceService } from '../../modules/v1/balance/balance.service';
-import { redisService } from '../redis/redis.service';
 import { logger } from '../../logger/logger';
+import { ConsumerHandle, startQueueConsumer } from './base.consumer';
 
-interface BalanceEvent {
-  payload: { groupId: string };
-  messageId: string;
-}
+/** Recalculates a group's balances and caches them in Redis (balances:<groupId>). */
+export function startBalanceConsumer(): Promise<ConsumerHandle> {
+  return startQueueConsumer({
+    name: 'balance',
+    queue: QueueName.BALANCE_RECALCULATE,
+    handler: async (event) => {
+      const groupId = event.payload['groupId'];
+      if (typeof groupId !== 'string') throw new Error('balance event without groupId');
 
-export async function startBalanceConsumer(): Promise<void> {
-  const channel: Channel = getRabbitChannel();
-  await channel.prefetch(1);
-
-  channel.consume(QueueName.BALANCE_RECALCULATE, (msg: ConsumeMessage | null) => {
-    if (!msg) return;
-
-    const processMsg = async () => {
-      try {
-        const event = JSON.parse(msg.content.toString()) as BalanceEvent;
-        const { groupId } = event.payload;
-
-        logger.debug('Recalculating balances', { groupId, messageId: event.messageId });
-
-        const balances = await balanceService.calculateGroupBalances(groupId);
-        await redisService.setGroupBalances(groupId, JSON.stringify(balances));
-        await redisService.clearBalanceStale(groupId);
-
-        channel.ack(msg);
-        logger.debug('Balance recalculated', { groupId });
-      } catch (err) {
-        logger.error('Balance consumer error', { err });
-        channel.nack(msg, false, false);
-      }
-    };
-
-    void processMsg();
+      await balanceService.refreshGroupBalances(groupId);
+      logger.debug('Balance recalculated', { groupId, eventType: event.eventType });
+    },
   });
-
-  logger.info('Balance consumer started');
 }

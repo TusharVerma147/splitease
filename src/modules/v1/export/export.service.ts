@@ -1,62 +1,62 @@
 import path from 'path';
 import fs from 'fs';
-import mongoose from 'mongoose';
 import { ExportRepository } from '../../../repositories/export.repository';
 import { GroupRepository } from '../../../repositories/group.repository';
-import { ExpenseModel } from '../../../schemas/expense.schema';
+import { ExpenseRepository } from '../../../repositories/expense.repository';
+import { UserRepository } from '../../../repositories/user.repository';
 import { Errors } from '../../../common/errors';
+import { config } from '../../../config/configuration';
 import { ExportStatus, QueueName, EventType } from '../../../enum/enum';
 import { redisService } from '../../../providers/redis/redis.service';
-import { publishToQueue, buildMessage } from '../../../providers/rabbitmq/rabbitmq.publisher';
+import { publishEvent } from '../../../providers/rabbitmq/rabbitmq.publisher';
+import { workerThreadService } from '../../../providers/workerThread/worker-thread.service';
+import type { CsvInput, CsvOutput } from '../../../providers/workerThread/exportCsv.worker';
+import { logger } from '../../../logger/logger';
 import { IExport } from '../../../schemas/export.schema';
+import { ExportRequestResult, ExportStatusView } from './interface/export.interface';
 
 const exportRepo = new ExportRepository();
 const groupRepo = new GroupRepository();
-
-export const EXPORT_DIR = path.join(process.cwd(), 'exports');
+const expenseRepo = new ExpenseRepository();
+const userRepo = new UserRepository();
 
 export class ExportService {
-  async requestExport(groupId: string, requestedBy: string): Promise<IExport> {
-    const group = await groupRepo.findById(groupId);
-    if (!group) throw Errors.notFound('Group');
+  async requestExport(groupId: string, requestedBy: string): Promise<ExportRequestResult> {
+    const exportDoc = await exportRepo.createQueued(groupId, requestedBy);
+    const exportId = String(exportDoc._id);
 
-    const exportDoc = await exportRepo.create({
-      groupId: new mongoose.Types.ObjectId(groupId) as unknown as mongoose.Types.ObjectId,
-      requestedBy: new mongoose.Types.ObjectId(requestedBy) as unknown as mongoose.Types.ObjectId,
-      status: ExportStatus.QUEUED,
-    });
+    await redisService.setExportProgress(exportId, 0);
+    await publishEvent([QueueName.EXPORT], EventType.EXPORT_REQUESTED, { exportId, groupId, requestedBy });
 
-    await redisService.setExportProgress(String(exportDoc._id), 0);
+    return { exportId, status: exportDoc.status };
+  }
 
-    publishToQueue(
-      QueueName.EXPORT,
-      buildMessage(EventType.EXPENSE_CREATED, {
-        exportId: String(exportDoc._id),
-        groupId,
-      }),
-    );
-
+  /** Visible to members of the group the export belongs to. */
+  private async getAccessibleExport(exportId: string, userId: string): Promise<IExport> {
+    const exportDoc = await exportRepo.findById(exportId);
+    if (!exportDoc) throw Errors.notFound('Export');
+    if (!(await groupRepo.isMember(String(exportDoc.groupId), userId))) throw Errors.notFound('Export');
     return exportDoc;
   }
 
-  async getExportStatus(exportId: string, requestedBy: string): Promise<IExport & { progress: number }> {
-    const exportDoc = await exportRepo.findById(exportId);
-    if (!exportDoc || String(exportDoc.requestedBy) !== requestedBy) throw Errors.notFound('Export');
-
-    const progress = await redisService.getExportProgress(exportId);
-    return Object.assign(exportDoc.toObject(), { progress }) as IExport & { progress: number };
+  async getExportStatus(exportId: string, userId: string): Promise<ExportStatusView> {
+    const exportDoc = await this.getAccessibleExport(exportId, userId);
+    const progress = exportDoc.status === ExportStatus.DONE ? 100 : await redisService.getExportProgress(exportId);
+    return { status: exportDoc.status, progress, ...(exportDoc.error && { error: exportDoc.error }) };
   }
 
-  async downloadExport(exportId: string, requestedBy: string): Promise<string> {
-    const exportDoc = await exportRepo.findById(exportId);
-    if (!exportDoc || String(exportDoc.requestedBy) !== requestedBy) throw Errors.notFound('Export');
-    if (exportDoc.status !== ExportStatus.DONE || !exportDoc.filePath) {
-      throw Errors.notFound('Export file not ready');
-    }
+  /** Returns the CSV path; 404 until the export is DONE. */
+  async downloadExport(exportId: string, userId: string): Promise<string> {
+    const exportDoc = await this.getAccessibleExport(exportId, userId);
+    if (exportDoc.status !== ExportStatus.DONE || !exportDoc.filePath) throw Errors.notFound('Export file');
     return exportDoc.filePath;
   }
 
+  /** Runs inside the export consumer: gathers data, builds the CSV on a worker thread, saves it. */
   async processExport(exportId: string, groupId: string): Promise<void> {
+    const exportDoc = await exportRepo.findById(exportId);
+    if (!exportDoc || exportDoc.status === ExportStatus.DONE) return;
+
     await exportRepo.updateStatus(exportId, ExportStatus.PROCESSING);
     await redisService.setExportProgress(exportId, 10);
 
@@ -64,61 +64,53 @@ export class ExportService {
       const group = await groupRepo.findById(groupId);
       if (!group) throw new Error('Group not found');
 
-      await redisService.setExportProgress(exportId, 30);
+      const expenses = await expenseRepo.findAllByGroup(groupId);
+      await redisService.setExportProgress(exportId, 40);
 
-      const expenses = await ExpenseModel.find({
-        groupId: new mongoose.Types.ObjectId(groupId),
-        isDeleted: false,
-      })
-        .sort({ expenseDate: 1 })
-        .lean();
+      // Former members still appear in old expenses, so they keep a column too.
+      const memberIds = group.members.map((m) => String(m.userId));
+      const formerIds = new Set<string>();
+      for (const e of expenses) {
+        for (const id of [String(e.paidBy), ...e.splits.map((s) => String(s.userId))]) {
+          if (!memberIds.includes(id)) formerIds.add(id);
+        }
+      }
+      const userIds = new Set<string>([...memberIds, ...formerIds]);
+      const users = await userRepo.findByIds([...userIds]);
+      const names = new Map(users.map((u) => [String(u._id), u.name]));
+      await redisService.setExportProgress(exportId, 55);
 
-      await redisService.setExportProgress(exportId, 50);
+      const input: CsvInput = {
+        members: [...memberIds, ...formerIds].map((userId) => ({
+          userId,
+          name: names.get(userId) ?? 'Unknown',
+        })),
+        expenses: expenses.map((e) => ({
+          date: e.expenseDate.toISOString().slice(0, 10),
+          description: e.description,
+          paidBy: names.get(String(e.paidBy)) ?? 'Unknown',
+          amount: e.amount,
+          splitType: e.splitType,
+          splits: e.splits.map((s) => ({ userId: String(s.userId), share: s.share })),
+        })),
+      };
 
-      const User = mongoose.model('User');
-      const memberIds = group.members.map((m) => m.userId);
-      const users = (await User.find({ _id: { $in: memberIds } })
-        .select('name')
-        .lean()) as unknown as Array<{ _id: mongoose.Types.ObjectId; name: string }>;
-      const nameMap = new Map(users.map((u) => [String(u._id), u.name]));
+      // CPU-bound work happens off the main thread; input and output are plain data.
+      const { csv } = await workerThreadService.runTask<CsvInput, CsvOutput>('exportCsv', input);
+      await redisService.setExportProgress(exportId, 80);
 
-      const members = group.members.map((m) => ({
-        userId: String(m.userId),
-        name: nameMap.get(String(m.userId)) ?? 'Unknown',
-      }));
-
-      await redisService.setExportProgress(exportId, 70);
-
-      const memberNames = members.map((m) => m.name);
-      const header = ['date', 'description', 'paidBy', 'amount(paise)', 'splitType', ...memberNames].join(',');
-
-      const rows = expenses.map((exp) => {
-        const paidByName = nameMap.get(String(exp.paidBy)) ?? String(exp.paidBy);
-        const memberShares = members.map((m) => {
-          const split = exp.splits.find((s) => String(s.userId) === m.userId);
-          return split ? split.share : 0;
-        });
-        return [
-          new Date(exp.expenseDate).toISOString().split('T')[0],
-          `"${exp.description}"`,
-          paidByName,
-          exp.amount,
-          exp.splitType,
-          ...memberShares,
-        ].join(',');
-      });
-
-      const csv = [header, ...rows].join('\n');
-      fs.mkdirSync(EXPORT_DIR, { recursive: true });
-      const filePath = path.join(EXPORT_DIR, `export_${exportId}.csv`);
-      fs.writeFileSync(filePath, csv, 'utf-8');
+      await fs.promises.mkdir(config.EXPORT_DIR, { recursive: true });
+      const filePath = path.join(config.EXPORT_DIR, `export_${exportId}.csv`);
+      const tmpPath = `${filePath}.tmp`;
+      await fs.promises.writeFile(tmpPath, csv, 'utf-8');
+      await fs.promises.rename(tmpPath, filePath);
 
       await redisService.setExportProgress(exportId, 100);
       await exportRepo.updateStatus(exportId, ExportStatus.DONE, { filePath });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error';
+      logger.error('Export failed', { exportId, err });
       await exportRepo.updateStatus(exportId, ExportStatus.FAILED, { error: message });
-      await redisService.setExportProgress(exportId, 0);
     }
   }
 }

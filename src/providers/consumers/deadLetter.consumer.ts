@@ -1,19 +1,20 @@
-import { Channel, ConsumeMessage } from 'amqplib';
-import { getRabbitChannel } from '../rabbitmq/rabbitmq.provider';
 import { QueueName } from '../../enum/enum';
 import { logger } from '../../logger/logger';
+import { ConsumerHandle, startQueueConsumer } from './base.consumer';
 
-export async function startDeadLetterConsumer(): Promise<void> {
-  const channel: Channel = getRabbitChannel();
-
-  channel.consume(QueueName.DEAD_LETTER, (msg: ConsumeMessage | null) => {
-    if (!msg) return;
-    logger.error('Dead letter message received', {
-      content: msg.content.toString(),
-      fields: msg.fields,
-    });
-    channel.ack(msg);
+/** Parks failed messages: logs them loudly so they can be inspected and replayed. */
+export function startDeadLetterConsumer(): Promise<ConsumerHandle> {
+  return startQueueConsumer({
+    name: 'dead-letter',
+    queue: QueueName.DEAD_LETTER,
+    plain: true,
+    handler: (event) => {
+      logger.error('Dead-lettered message', {
+        eventType: event.eventType,
+        messageId: event.messageId,
+        payload: event.payload,
+      });
+      return Promise.resolve();
+    },
   });
-
-  logger.info('Dead letter consumer started');
 }
