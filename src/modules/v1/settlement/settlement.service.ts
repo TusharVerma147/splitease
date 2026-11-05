@@ -1,48 +1,65 @@
-import mongoose, { Types } from 'mongoose';
+import { Types } from 'mongoose';
 import { SettlementRepository } from '../../../repositories/settlement.repository';
 import { GroupRepository } from '../../../repositories/group.repository';
 import { Errors } from '../../../common/errors';
 import { redisService } from '../../../providers/redis/redis.service';
-import { publishToQueue, buildMessage } from '../../../providers/rabbitmq/rabbitmq.publisher';
+import { publishEvent } from '../../../providers/rabbitmq/rabbitmq.publisher';
 import { QueueName, EventType } from '../../../enum/enum';
-import { paginated } from '../../../common/responses';
+import { paginated, PaginatedData } from '../../../common/responses';
 import { parsePagination } from '../../../common/utils';
 import { ISettlement } from '../../../schemas/settlement.schema';
+import { CreateSettlementDto, ListSettlementsQueryDto } from './dto/settlement.dto';
+import { SettlementView } from './interface/settlement.interface';
 
 const settlementRepo = new SettlementRepository();
 const groupRepo = new GroupRepository();
 
+function toSettlementView(s: ISettlement): SettlementView {
+  return {
+    id: String(s._id),
+    groupId: String(s.groupId),
+    fromUserId: String(s.fromUserId),
+    toUserId: String(s.toUserId),
+    amount: s.amount,
+    note: s.note,
+    createdAt: s.createdAt,
+  };
+}
+
 export class SettlementService {
-  async createSettlement(
-    groupId: string,
-    data: { fromUserId: string; toUserId: string; amount: number; note?: string },
-  ): Promise<ISettlement> {
-    const group = await groupRepo.findById(groupId);
+  async createSettlement(groupId: string, data: CreateSettlementDto, actorId: string): Promise<SettlementView> {
+    const group = await groupRepo.findActiveById(groupId);
     if (!group) throw Errors.notFound('Group');
 
     const memberIds = group.members.map((m) => String(m.userId));
-    if (!memberIds.includes(data.fromUserId)) throw Errors.notGroupMember();
-    if (!memberIds.includes(data.toUserId)) throw Errors.notGroupMember();
+    if (!memberIds.includes(data.fromUserId)) throw Errors.notGroupMember('fromUserId is not a member of this group');
+    if (!memberIds.includes(data.toUserId)) throw Errors.notGroupMember('toUserId is not a member of this group');
 
     const settlement = await settlementRepo.create({
-      groupId: new Types.ObjectId(groupId) as unknown as mongoose.Types.ObjectId,
-      fromUserId: new Types.ObjectId(data.fromUserId) as unknown as mongoose.Types.ObjectId,
-      toUserId: new Types.ObjectId(data.toUserId) as unknown as mongoose.Types.ObjectId,
+      groupId: new Types.ObjectId(groupId),
+      fromUserId: new Types.ObjectId(data.fromUserId),
+      toUserId: new Types.ObjectId(data.toUserId),
       amount: data.amount,
       note: data.note,
     });
 
-    await redisService.invalidateGroupBalances(groupId);
-    publishToQueue(QueueName.BALANCE_RECALCULATE, buildMessage(EventType.SETTLEMENT_CREATED, { groupId, settlementId: String(settlement._id) }));
-    publishToQueue(QueueName.NOTIFICATION, buildMessage(EventType.SETTLEMENT_CREATED, { groupId, settlementId: String(settlement._id) }));
+    await redisService.bumpBalanceVersion(groupId);
+    await publishEvent([QueueName.BALANCE_RECALCULATE, QueueName.NOTIFICATION], EventType.SETTLEMENT_CREATED, {
+      groupId,
+      settlementId: String(settlement._id),
+      fromUserId: data.fromUserId,
+      toUserId: data.toUserId,
+      amount: data.amount,
+      actorId,
+    });
 
-    return settlement;
+    return toSettlementView(settlement);
   }
 
-  async listSettlements(groupId: string, query: Record<string, unknown>) {
+  async listSettlements(groupId: string, query: ListSettlementsQueryDto): Promise<PaginatedData<SettlementView>> {
     const { page, limit, skip } = parsePagination(query);
-    const { items, total } = await settlementRepo.listByGroup(groupId, skip, limit);
-    return paginated(items, total, page, limit);
+    const { items, total } = await settlementRepo.listByGroup(groupId, skip, limit, query.sortBy, query.order);
+    return paginated(items.map(toSettlementView), total, page, limit);
   }
 }
 

@@ -1,132 +1,80 @@
-import mongoose from 'mongoose';
-import { ExpenseModel } from '../../../schemas/expense.schema';
-import { SettlementModel } from '../../../schemas/settlement.schema';
 import { GroupRepository } from '../../../repositories/group.repository';
+import { ExpenseRepository } from '../../../repositories/expense.repository';
+import { SettlementRepository } from '../../../repositories/settlement.repository';
+import { UserRepository } from '../../../repositories/user.repository';
 import { Errors } from '../../../common/errors';
+import { computeNetBalances } from '../../../common/utils';
 import { redisService } from '../../../providers/redis/redis.service';
+import { GroupBalanceResult, MemberBalance, MyBalancesResult } from './interface/balance.interface';
 
 const groupRepo = new GroupRepository();
-
-export interface MemberBalance {
-  userId: string;
-  name: string;
-  net: number;
-}
-
-export interface GroupBalanceResult {
-  groupId: string;
-  balances: MemberBalance[];
-  stale: boolean;
-}
+const expenseRepo = new ExpenseRepository();
+const settlementRepo = new SettlementRepository();
+const userRepo = new UserRepository();
 
 export class BalanceService {
+  /** Fresh balances straight from expenses + settlements (aggregation pipelines). */
   async calculateGroupBalances(groupId: string): Promise<MemberBalance[]> {
-    const gid = new mongoose.Types.ObjectId(groupId);
-
-    const expenseAgg = await ExpenseModel.aggregate([
-      { $match: { groupId: gid, isDeleted: false } },
-      {
-        $facet: {
-          paid: [{ $group: { _id: '$paidBy', totalPaid: { $sum: '$amount' } } }],
-          owed: [
-            { $unwind: '$splits' },
-            { $group: { _id: '$splits.userId', totalOwed: { $sum: '$splits.share' } } },
-          ],
-        },
-      },
-    ]);
-
-    const settlementAgg = await SettlementModel.aggregate([
-      { $match: { groupId: gid } },
-      {
-        $facet: {
-          paid: [{ $group: { _id: '$fromUserId', totalPaid: { $sum: '$amount' } } }],
-          received: [{ $group: { _id: '$toUserId', totalReceived: { $sum: '$amount' } } }],
-        },
-      },
-    ]);
-
-    const data = expenseAgg[0] as {
-      paid: Array<{ _id: mongoose.Types.ObjectId; totalPaid: number }>;
-      owed: Array<{ _id: mongoose.Types.ObjectId; totalOwed: number }>;
-    };
-
-    const sData = settlementAgg[0] as {
-      paid: Array<{ _id: mongoose.Types.ObjectId; totalPaid: number }>;
-      received: Array<{ _id: mongoose.Types.ObjectId; totalReceived: number }>;
-    };
-
-    const netMap = new Map<string, number>();
-
-    for (const p of data.paid) {
-      const key = String(p._id);
-      netMap.set(key, (netMap.get(key) ?? 0) + p.totalPaid);
-    }
-    for (const o of data.owed) {
-      const key = String(o._id);
-      netMap.set(key, (netMap.get(key) ?? 0) - o.totalOwed);
-    }
-    for (const sp of sData.paid) {
-      const key = String(sp._id);
-      netMap.set(key, (netMap.get(key) ?? 0) - sp.totalPaid);
-    }
-    for (const sr of sData.received) {
-      const key = String(sr._id);
-      netMap.set(key, (netMap.get(key) ?? 0) + sr.totalReceived);
-    }
-
     const group = await groupRepo.findById(groupId);
     if (!group) throw Errors.notFound('Group');
 
-    const UserModel = mongoose.model('User');
-    const memberIds = group.members.map((m) => m.userId);
-    const users = await UserModel.find({ _id: { $in: memberIds } }).select('name').lean();
-    const nameMap = new Map<string, string>();
-    for (const u of users as unknown as Array<{ _id: mongoose.Types.ObjectId; name: string }>) {
-      nameMap.set(String(u._id), u.name);
-    }
+    const [expenses, settlements, users] = await Promise.all([
+      expenseRepo.totalsByGroup(groupId),
+      settlementRepo.totalsByGroup(groupId),
+      userRepo.findByIds(group.members.map((m) => m.userId)),
+    ]);
+
+    const net = computeNetBalances({
+      expensePaid: expenses.paid,
+      expenseOwed: expenses.owed,
+      settlementPaid: settlements.paid,
+      settlementReceived: settlements.received,
+    });
+    const names = new Map(users.map((u) => [String(u._id), u.name]));
 
     return group.members.map((m) => ({
       userId: String(m.userId),
-      name: nameMap.get(String(m.userId)) ?? 'Unknown',
-      net: netMap.get(String(m.userId)) ?? 0,
+      name: names.get(String(m.userId)) ?? 'Unknown',
+      net: net.get(String(m.userId)) ?? 0,
     }));
   }
 
-  async getGroupBalances(groupId: string): Promise<GroupBalanceResult> {
-    const cached = await redisService.getGroupBalances(groupId);
-    const stale = await redisService.isBalanceStale(groupId);
-
-    if (cached && !stale) {
-      return {
-        groupId,
-        balances: JSON.parse(cached) as MemberBalance[],
-        stale: false,
-      };
-    }
-
+  /**
+   * Recalculates and caches the balances. The version read *before* calculating is
+   * stored with them, so a write that lands mid-calculation still shows as stale.
+   */
+  async refreshGroupBalances(groupId: string): Promise<MemberBalance[]> {
+    const version = await redisService.getBalanceVersion(groupId);
     const balances = await this.calculateGroupBalances(groupId);
-    await redisService.setGroupBalances(groupId, JSON.stringify(balances));
-    await redisService.clearBalanceStale(groupId);
-
-    return { groupId, balances, stale };
+    await redisService.setGroupBalances(groupId, version, balances);
+    return balances;
   }
 
-  async getMyBalances(userId: string): Promise<{ groupId: string; groupName: string; net: number }[]> {
+  /** Served from the Redis cache. `stale` means a recalculation is still queued. */
+  async getGroupBalances(groupId: string): Promise<GroupBalanceResult> {
+    const [cached, version] = await Promise.all([
+      redisService.getGroupBalances<MemberBalance>(groupId),
+      redisService.getBalanceVersion(groupId),
+    ]);
+    if (cached) return { groupId, balances: cached.balances, stale: cached.version !== version };
+
+    const balances = await this.refreshGroupBalances(groupId);
+    return { groupId, balances, stale: false };
+  }
+
+  async getMyBalances(userId: string): Promise<MyBalancesResult> {
     const groups = await groupRepo.findUserGroups(userId);
-    const results: { groupId: string; groupName: string; net: number }[] = [];
+    const perGroup = await Promise.all(
+      groups.map(async (group) => {
+        const { balances } = await this.getGroupBalances(String(group._id));
+        const mine = balances.find((b) => b.userId === userId);
+        return { groupId: String(group._id), groupName: group.name, net: mine?.net ?? 0 };
+      }),
+    );
 
-    for (const group of groups) {
-      const { balances } = await this.getGroupBalances(String(group._id));
-      const mine = balances.find((b) => b.userId === userId);
-      results.push({
-        groupId: String(group._id),
-        groupName: group.name,
-        net: mine?.net ?? 0,
-      });
-    }
-
-    return results;
+    const totalOwe = perGroup.reduce((sum, g) => sum + (g.net < 0 ? -g.net : 0), 0);
+    const totalOwed = perGroup.reduce((sum, g) => sum + (g.net > 0 ? g.net : 0), 0);
+    return { totalOwe, totalOwed, net: totalOwed - totalOwe, groups: perGroup };
   }
 }
 

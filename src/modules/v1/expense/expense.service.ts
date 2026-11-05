@@ -1,182 +1,161 @@
-import mongoose, { Types } from 'mongoose';
+import { Types, UpdateQuery } from 'mongoose';
 import { ExpenseRepository } from '../../../repositories/expense.repository';
 import { GroupRepository } from '../../../repositories/group.repository';
 import { Errors } from '../../../common/errors';
 import { SplitType, QueueName, EventType } from '../../../enum/enum';
-import { equalSplit, percentToShares, parsePagination } from '../../../common/utils';
-import { IExpense, IExpenseSplit } from '../../../schemas/expense.schema';
-import { publishToQueue, buildMessage } from '../../../providers/rabbitmq/rabbitmq.publisher';
+import { calculateSplits, parsePagination } from '../../../common/utils';
+import { paginated, PaginatedData } from '../../../common/responses';
+import { IExpense, IExpenseLean } from '../../../schemas/expense.schema';
+import { publishEvent } from '../../../providers/rabbitmq/rabbitmq.publisher';
 import { redisService } from '../../../providers/redis/redis.service';
+import { CreateExpenseDto, ListExpensesQueryDto, UpdateExpenseDto } from './dto/expense.dto';
+import { ExpenseView } from './interface/expense.interface';
 
 const expenseRepo = new ExpenseRepository();
 const groupRepo = new GroupRepository();
 
-interface SplitInput {
-  userId: string;
-  share?: number;
-  percent?: number;
+type ExpenseLike = IExpense | IExpenseLean;
+
+export function toExpenseView(expense: ExpenseLike): ExpenseView {
+  return {
+    id: String(expense._id),
+    groupId: String(expense.groupId),
+    description: expense.description,
+    amount: expense.amount,
+    paidBy: String(expense.paidBy),
+    splitType: expense.splitType,
+    splits: expense.splits.map((s) => ({ userId: String(s.userId), share: s.share })),
+    expenseDate: expense.expenseDate,
+    createdBy: String(expense.createdBy),
+    createdAt: expense.createdAt,
+    updatedAt: expense.updatedAt,
+  };
 }
 
-function buildSplits(
-  splitType: SplitType,
-  amount: number,
-  participants: string[] | undefined,
-  splits: SplitInput[] | undefined,
-  groupMemberIds: string[],
-): IExpenseSplit[] {
-  if (splitType === SplitType.EQUAL) {
-    if (!participants?.length) throw Errors.validationError('participants required for EQUAL split');
-    for (const uid of participants) {
-      if (!groupMemberIds.includes(uid)) throw Errors.notGroupMember();
-    }
-    const shares = equalSplit(amount, participants.length);
-    return participants.map((userId, i) => ({
-      userId: new Types.ObjectId(userId),
-      share: shares[i]!,
-    })) as unknown as IExpenseSplit[];
-  }
-
-  if (splitType === SplitType.EXACT) {
-    if (!splits?.length) throw Errors.validationError('splits required for EXACT split');
-    const total = splits.reduce((sum, s) => sum + (s.share ?? 0), 0);
-    if (total !== amount) throw Errors.splitTotalMismatch();
-    for (const s of splits) {
-      if (!groupMemberIds.includes(s.userId)) throw Errors.notGroupMember();
-    }
-    return splits.map((s) => ({
-      userId: new Types.ObjectId(s.userId),
-      share: s.share!,
-    })) as unknown as IExpenseSplit[];
-  }
-
-  // PERCENT
-  if (!splits?.length) throw Errors.validationError('splits required for PERCENT split');
-  const totalPercent = splits.reduce((sum, s) => sum + (s.percent ?? 0), 0);
-  if (Math.round(totalPercent) !== 100) throw Errors.splitTotalMismatch();
-  for (const s of splits) {
-    if (!groupMemberIds.includes(s.userId)) throw Errors.notGroupMember();
-  }
-  const percents = splits.map((s) => s.percent!);
-  const shares = percentToShares(amount, percents);
-  return splits.map((s, i) => ({
-    userId: new Types.ObjectId(s.userId),
-    share: shares[i]!,
-  })) as unknown as IExpenseSplit[];
+/** `to=2026-10-31` should include the whole day. */
+function endOfRange(value: string): Date {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T23:59:59.999Z`) : new Date(value);
 }
 
 export class ExpenseService {
-  async addExpense(
-    groupId: string,
-    data: {
-      description: string;
-      amount: number;
-      paidBy: string;
-      splitType: SplitType;
-      participants?: string[];
-      splits?: SplitInput[];
-      expenseDate: string;
-    },
-    createdBy: string,
-  ): Promise<IExpense> {
-    const group = await groupRepo.findById(groupId);
+  private async memberIds(groupId: string): Promise<string[]> {
+    const group = await groupRepo.findActiveById(groupId);
     if (!group) throw Errors.notFound('Group');
-
-    const memberIds = group.members.map((m) => String(m.userId));
-    if (!memberIds.includes(data.paidBy)) throw Errors.notGroupMember();
-
-    const splits = buildSplits(data.splitType, data.amount, data.participants, data.splits, memberIds);
-
-    const expense = await expenseRepo.create({
-      groupId: new Types.ObjectId(groupId) as unknown as mongoose.Types.ObjectId,
-      description: data.description,
-      amount: data.amount,
-      paidBy: new Types.ObjectId(data.paidBy) as unknown as mongoose.Types.ObjectId,
-      splitType: data.splitType,
-      splits,
-      expenseDate: new Date(data.expenseDate),
-      createdBy: new Types.ObjectId(createdBy) as unknown as mongoose.Types.ObjectId,
-    });
-
-    await redisService.invalidateGroupBalances(groupId);
-    publishToQueue(QueueName.BALANCE_RECALCULATE, buildMessage(EventType.EXPENSE_CREATED, { groupId, expenseId: String(expense._id) }));
-    publishToQueue(QueueName.NOTIFICATION, buildMessage(EventType.EXPENSE_CREATED, { groupId, expenseId: String(expense._id), createdBy }));
-
-    return expense;
+    return group.members.map((m) => String(m.userId));
   }
 
-  async listExpenses(
+  /** Marks cached balances stale and tells the consumers to recalculate + notify. */
+  private async publishChange(
+    eventType: EventType,
     groupId: string,
-    query: Record<string, unknown>,
-  ): Promise<{ items: IExpense[]; total: number; page: number; limit: number }> {
-    const { page, limit, skip } = parsePagination(query);
-    const result = await expenseRepo.listWithTotal({
+    expense: ExpenseLike,
+    actorId: string,
+  ): Promise<void> {
+    await redisService.bumpBalanceVersion(groupId);
+    await publishEvent([QueueName.BALANCE_RECALCULATE, QueueName.NOTIFICATION], eventType, {
       groupId,
-      search: query['search'] as string | undefined,
-      paidBy: query['paidBy'] as string | undefined,
-      from: query['from'] ? new Date(query['from'] as string) : undefined,
-      to: query['to'] ? new Date(query['to'] as string) : undefined,
-      sortBy: (query['sortBy'] as string) ?? 'expenseDate',
-      order: (query['order'] as 'asc' | 'desc') ?? 'desc',
+      expenseId: String(expense._id),
+      description: expense.description,
+      amount: expense.amount,
+      actorId,
+    });
+  }
+
+  async addExpense(groupId: string, data: CreateExpenseDto, createdBy: string): Promise<ExpenseView> {
+    const memberIds = await this.memberIds(groupId);
+    if (!memberIds.includes(data.paidBy)) throw Errors.notGroupMember('paidBy is not a member of this group');
+
+    const splits = calculateSplits(data.splitType, data.amount, data, memberIds);
+
+    const expense = await expenseRepo.create({
+      groupId: new Types.ObjectId(groupId),
+      description: data.description,
+      amount: data.amount,
+      paidBy: new Types.ObjectId(data.paidBy),
+      splitType: data.splitType,
+      splits: splits.map((s) => ({ userId: new Types.ObjectId(s.userId), share: s.share })),
+      expenseDate: new Date(data.expenseDate),
+      createdBy: new Types.ObjectId(createdBy),
+    });
+
+    await this.publishChange(EventType.EXPENSE_CREATED, groupId, expense, createdBy);
+    return toExpenseView(expense);
+  }
+
+  async listExpenses(groupId: string, query: ListExpensesQueryDto): Promise<PaginatedData<ExpenseView>> {
+    const { page, limit, skip } = parsePagination(query);
+    const { items, total } = await expenseRepo.listWithTotal({
+      groupId,
+      search: query.search,
+      paidBy: query.paidBy,
+      from: query.from ? new Date(query.from) : undefined,
+      to: query.to ? endOfRange(query.to) : undefined,
+      sortBy: query.sortBy,
+      order: query.order,
       skip,
       limit,
     });
-    return { ...result, page, limit };
+    return paginated(items.map(toExpenseView), total, page, limit);
   }
 
-  async getExpense(groupId: string, expenseId: string): Promise<IExpense> {
-    const expense = await expenseRepo.findOne({
-      _id: new Types.ObjectId(expenseId),
-      groupId: new Types.ObjectId(groupId),
-      isDeleted: false,
-    });
+  async getExpense(groupId: string, expenseId: string): Promise<ExpenseView> {
+    return toExpenseView(await this.getExpenseDoc(groupId, expenseId));
+  }
+
+  private async getExpenseDoc(groupId: string, expenseId: string): Promise<IExpense> {
+    const expense = await expenseRepo.findActive(groupId, expenseId);
     if (!expense) throw Errors.notFound('Expense');
     return expense;
   }
 
+  /**
+   * PATCH semantics: only the sent fields change. Splits are re-validated and rebuilt
+   * whenever something they depend on (amount, splitType, participants, splits) changes.
+   */
   async updateExpense(
     groupId: string,
     expenseId: string,
-    data: Partial<{
-      description: string;
-      amount: number;
-      paidBy: string;
-      splitType: SplitType;
-      participants: string[];
-      splits: SplitInput[];
-      expenseDate: string;
-    }>,
-  ): Promise<IExpense> {
-    const existing = await this.getExpense(groupId, expenseId);
-    const group = await groupRepo.findById(groupId);
-    if (!group) throw Errors.notFound('Group');
-    const memberIds = group.members.map((m) => String(m.userId));
+    data: UpdateExpenseDto,
+    actorId: string,
+  ): Promise<ExpenseView> {
+    const existing = await this.getExpenseDoc(groupId, expenseId);
+    const memberIds = await this.memberIds(groupId);
 
-    const newAmount = data.amount ?? existing.amount;
-    const newSplitType = data.splitType ?? existing.splitType;
-    const newSplits = buildSplits(newSplitType, newAmount, data.participants, data.splits, memberIds);
+    if (data.paidBy && !memberIds.includes(data.paidBy)) {
+      throw Errors.notGroupMember('paidBy is not a member of this group');
+    }
 
-    const updated = await expenseRepo.updateById(expenseId, {
-      ...(data.description && { description: data.description }),
-      ...(data.amount && { amount: data.amount }),
-      ...(data.paidBy && { paidBy: new Types.ObjectId(data.paidBy) }),
-      ...(data.splitType && { splitType: data.splitType }),
-      ...(data.expenseDate && { expenseDate: new Date(data.expenseDate) }),
-      splits: newSplits,
-    });
+    const update: UpdateQuery<IExpense> = {};
+    if (data.description !== undefined) update.description = data.description;
+    if (data.amount !== undefined) update.amount = data.amount;
+    if (data.paidBy !== undefined) update.paidBy = new Types.ObjectId(data.paidBy);
+    if (data.splitType !== undefined) update.splitType = data.splitType;
+    if (data.expenseDate !== undefined) update.expenseDate = new Date(data.expenseDate);
+
+    const splitsAffected =
+      data.amount !== undefined || data.splitType !== undefined || !!data.participants || !!data.splits;
+    if (splitsAffected) {
+      const amount = data.amount ?? existing.amount;
+      const splitType = data.splitType ?? existing.splitType;
+      const participants =
+        splitType === SplitType.EQUAL ? (data.participants ?? existing.splits.map((s) => String(s.userId))) : undefined;
+
+      const splits = calculateSplits(splitType, amount, { participants, splits: data.splits }, memberIds);
+      update.splits = splits.map((s) => ({ userId: new Types.ObjectId(s.userId), share: s.share }));
+    }
+
+    const updated = await expenseRepo.updateById(expenseId, update);
     if (!updated) throw Errors.notFound('Expense');
 
-    await redisService.invalidateGroupBalances(groupId);
-    publishToQueue(QueueName.BALANCE_RECALCULATE, buildMessage(EventType.EXPENSE_UPDATED, { groupId, expenseId }));
-
-    return updated;
+    await this.publishChange(EventType.EXPENSE_UPDATED, groupId, updated, actorId);
+    return toExpenseView(updated);
   }
 
-  async deleteExpense(groupId: string, expenseId: string): Promise<void> {
-    const expense = await this.getExpense(groupId, expenseId);
-    await expenseRepo.softDelete(String(expense._id));
+  async deleteExpense(groupId: string, expenseId: string, actorId: string): Promise<void> {
+    const deleted = await expenseRepo.softDelete(groupId, expenseId);
+    if (!deleted) throw Errors.notFound('Expense');
 
-    await redisService.invalidateGroupBalances(groupId);
-    publishToQueue(QueueName.BALANCE_RECALCULATE, buildMessage(EventType.EXPENSE_DELETED, { groupId, expenseId }));
+    await this.publishChange(EventType.EXPENSE_DELETED, groupId, deleted, actorId);
   }
 }
 

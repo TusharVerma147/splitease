@@ -1,34 +1,31 @@
 import { Request, Response } from 'express';
 import { settlementService } from './settlement.service';
-import { sendSuccess, sendError } from '../../../common/responses';
-import { AppError } from '../../../common/errors';
-import { CreateSettlementDto } from './dto/settlement.dto';
+import { settlePlanService } from './settle-plan.service';
+import { sendSuccess } from '../../../common/responses';
+import { CreateSettlementDto, ListSettlementsQueryDto } from './dto/settlement.dto';
 
 export class SettlementController {
-  async createSettlement(req: Request, res: Response): Promise<void> {
-    try {
-      const settlement = await settlementService.createSettlement(
-        req.params['groupId']!,
-        req.body as CreateSettlementDto,
-      );
-      sendSuccess(res, { settlement }, 'Settlement recorded', 201);
-    } catch (err) {
-      if (err instanceof AppError) sendError(res, err.statusCode, err.code, err.message, req.requestId);
-      else sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', req.requestId);
-    }
-  }
+  createSettlement = async (req: Request, res: Response): Promise<void> => {
+    const settlement = await settlementService.createSettlement(
+      req.params['groupId'] ?? '',
+      req.body as CreateSettlementDto,
+      req.user?.userId ?? '',
+    );
+    sendSuccess(res, settlement, 'Settlement recorded', 201);
+  };
 
-  async listSettlements(req: Request, res: Response): Promise<void> {
-    try {
-      const result = await settlementService.listSettlements(
-        req.params['groupId']!,
-        req.query as Record<string, unknown>,
-      );
-      sendSuccess(res, result, 'Settlements fetched');
-    } catch (err) {
-      sendError(res, 500, 'INTERNAL_ERROR', 'Internal server error', req.requestId);
-    }
-  }
+  listSettlements = async (req: Request, res: Response): Promise<void> => {
+    const result = await settlementService.listSettlements(
+      req.params['groupId'] ?? '',
+      req.query as unknown as ListSettlementsQueryDto,
+    );
+    sendSuccess(res, result, 'Settlements fetched');
+  };
+
+  getSettlePlan = async (req: Request, res: Response): Promise<void> => {
+    const payments = await settlePlanService.getSettlePlan(req.params['groupId'] ?? '');
+    sendSuccess(res, { payments }, 'Settle plan calculated');
+  };
 }
 
 export const settlementController = new SettlementController();

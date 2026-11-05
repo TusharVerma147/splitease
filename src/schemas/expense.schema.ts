@@ -20,6 +20,22 @@ export interface IExpense extends Document {
   updatedAt: Date;
 }
 
+/** Plain-object shape returned by lean() queries and aggregations. */
+export interface IExpenseLean {
+  _id: mongoose.Types.ObjectId;
+  groupId: mongoose.Types.ObjectId;
+  description: string;
+  amount: number;
+  paidBy: mongoose.Types.ObjectId;
+  splitType: SplitType;
+  splits: IExpenseSplit[];
+  expenseDate: Date;
+  createdBy: mongoose.Types.ObjectId;
+  isDeleted: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 const expenseSchema = new Schema<IExpense>(
   {
     groupId: { type: Schema.Types.ObjectId, required: true, ref: 'Group' },
